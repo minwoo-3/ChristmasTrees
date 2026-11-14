@@ -1,4 +1,4 @@
-# ChrismasTrees
+# ChristmasTrees
 
 A rotating 3D Christmas tree drawn entirely with Hangul characters.
 
@@ -42,6 +42,3 @@ handle cursor-control codes, so the frames pile up and the IDE freezes; the scri
 - Each screen cell keeps the nearest point. Hangul is two terminal columns wide, so one screen cell = two columns.
 - Foliage uses four brightness steps; inside a step every cell keeps a fixed glyph and tone, so the tree does not flicker while it turns.
 - The pygame version draws each glyph at its exact sub-cell position, eases cell colours between frames, keeps a fading trail and adds a two-layer glow.
-
-The flicker-free glyph choice and the two-layer glow were inspired by the approach in
-[JIN2's BLACK-HOLE ASCII art](https://github.com/JIN2-ASCII/-JIN2-ASCII/tree/main/BLACK-HOLE) (@jin_22ee). No code was copied.
