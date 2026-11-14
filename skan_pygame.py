@@ -20,13 +20,14 @@ import pygame
 
 import skan
 
-COLS, ROWS = 64, 78             # text grid (finer than the terminal version)
+COLS, ROWS = 90, 78             # window grid: wide enough for the snowman left of the tree
 BG = (14, 18, 34)               # a slightly lifted navy instead of near-black
 FPS = 30                        # steady 30 looks smoother than an uneven 40-60 (videos are 30 too)
 GLOW_NEAR = 0.70                # tight glow right around bright glyphs
 GLOW_FAR = 0.45                 # wide, faint haze
 COLOR_SMOOTH = 0.5              # how much of last frame's colour each cell keeps (less flicker)
-SOFTEN = 0.15                   # 0 = original colours, higher = paler, pastel-like
+HOLD_FRAMES = 2                 # an emptied cell keeps fading its glyph this many frames
+SOFTEN = 0.10                   # 0 = original colours, higher = paler, pastel-like
 TRAIL = 0.45                    # how much of the previous frame lingers (soft motion), 0 = none
 
 KOREAN_FONTS = [
@@ -96,14 +97,22 @@ def two_layer_glow(src, W, H):
     return pygame.transform.smoothscale(near, (W, H))
 
 
+def set_mode_vsync(size, flags):
+    """Open the window synced to the display refresh (no tearing); fall back if not supported."""
+    try:
+        return pygame.display.set_mode(size, flags, vsync=1)
+    except (pygame.error, TypeError):
+        return pygame.display.set_mode(size, flags)
+
+
 def make_layout(fullscreen):
     """Window or full screen. Rows are fixed so the tree keeps its size; columns fill the width."""
     if fullscreen:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        screen = set_mode_vsync((0, 0), pygame.FULLSCREEN)
     else:
         info = pygame.display.Info()
-        cell = max(8, min(16, int(info.current_h * 0.86 / ROWS)))
-        screen = pygame.display.set_mode((COLS * cell, ROWS * cell))
+        cell = max(8, min(16, int(info.current_h * 0.86 / ROWS), int(info.current_w * 0.95 / COLS)))
+        screen = set_mode_vsync((COLS * cell, ROWS * cell), 0)
     pygame.mouse.set_visible(not fullscreen)
     W, H = screen.get_size()
     cell = max(6, H // ROWS)
@@ -136,7 +145,7 @@ def main():
     timer = pygame.time.Clock()
     anim = 0.0                              # animation time: advances by the frame time, at most 1/15 s
     glow_on = True
-    prev_col, prev_on = None, None
+    prev_col, prev_on, prev_char, prev_off, hold = None, None, None, None, None
     glow, frame_no = None, 0
 
     # the tree maths (numpy) runs in a worker thread for the NEXT frame while this frame is drawn
@@ -182,7 +191,21 @@ def main():
         if prev_col is not None and prev_col.shape == col.shape:
             both = (on & prev_on)[..., None]
             col = np.where(both, col * (1 - COLOR_SMOOTH) + prev_col * COLOR_SMOOTH, col)
-        prev_col, prev_on = col, on
+            # a cell that just went empty keeps its glyph for up to 2 frames, fading,
+            # so cells do not blink on and off while the tree turns
+            gone = ~on & prev_on & (hold < HOLD_FRAMES)
+            if gone.any():
+                char, col = char.copy(), col.copy()
+                char[gone] = prev_char[gone]
+                col[gone] = prev_col[gone] * 0.7
+                offx, offy = inf["off"][0].copy(), inf["off"][1].copy()
+                offx[gone], offy[gone] = prev_off[0][gone], prev_off[1][gone]
+                inf["off"] = (offx, offy)
+            hold = np.where(gone, hold + 1, 0)
+            on = char > 0
+        else:
+            hold = np.zeros(char.shape, np.int8)
+        prev_col, prev_on, prev_char, prev_off = col, on, char, inf["off"]
 
         screen, W, H, cell, layer = L["screen"], L["W"], L["H"], L["cell"], L["layer"]
         ox, oy, glyphs = L["ox"], L["oy"], L["glyphs"]
