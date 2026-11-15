@@ -93,7 +93,7 @@ YELLOW = (1.00, 0.88, 0.30)
 GREENS = np.array([(0.45, 0.95, 0.68), (0.12, 0.74, 0.42), (0.10, 0.62, 0.58),
                    (0.42, 0.86, 0.32), (0.06, 0.45, 0.28)])
 GREEN_W = np.array([0.24, 0.28, 0.18, 0.12, 0.18])
-BAUBLE_COLS = [RED, GOLD, BLUE, PURPLE, PINK, CYAN, WHITE, ORANGE]
+BAUBLE_COLS = [(0.90, 0.10, 0.10), (1.00, 0.72, 0.12)]       # ornaments: red and gold only
 GOLDS = np.array([(1.00, 0.80, 0.25), (1.00, 0.66, 0.15), (1.00, 0.92, 0.50)])
 SNOW_TINTS = np.array([(0.92, 0.95, 1.00), (0.80, 0.88, 1.00), (0.88, 0.84, 1.00), (0.82, 0.96, 1.00)])
 LIGHT_COLS = [(0.95, 0.10, 0.08), (1.00, 0.68, 0.08)]          # fairy lights: deep red and gold only
@@ -312,15 +312,6 @@ def build():
     q.add(n * 0.08 + np.stack([np.zeros(m), y, np.zeros(m)], 1), n,
           np.array([0.50, 0.30, 0.15]) * bark[:, None], TRUNK,
           T_TRUNK[0] + (T_TRUNK[1] - T_TRUNK[0]) * (y - GROUND) / (Y0 + 0.1 - GROUND))
-
-    # snow on the ground: spreads out from the trunk as it appears, then keeps piling up
-    m = int(3500 * DETAIL)
-    r = 0.12 + 2.5 * np.sqrt(rng.random(m))
-    a = rng.random(m) * TAU
-    gp = np.stack([np.cos(a) * r, GROUND + 0.004 + 0.01 * rng.random(m), np.sin(a) * r], 1)
-    spread = 2.5 * r / 2.6
-    t0 = T_GSNOW[0] + spread + rng.random(m) ** 1.6 * (T_GSNOW[1] - T_GSNOW[0] - spread)
-    q.add(gp, (0, 1, 0), SNOW_TINTS[rng.integers(0, 4, m)], GSNOW, t0, base=rng.uniform(0.8, 1.15, m), phase=rng.random(m))
 
     # the glowing ribbon that winds up the tree
     wmax = 1 + 1 / WRAP_TURNS
@@ -570,14 +561,6 @@ class Backdrop:
         return x, y
 
     def draw(self, char, col, ang, clock, cols, rows, off=None):
-        p = rotate_y(self.gp, ang)
-        sx, sy, zc = project(p, cols, rows, ASPECT)
-        ix, iy = np.round(sx).astype(int), np.round(sy).astype(int)
-        ok = (zc > 0.5) & (ix >= 0) & (ix < cols) & (iy >= 0) & (iy < rows)
-        ix, iy, zc, ch = ix[ok], iy[ok], zc[ok], self.gch[ok]
-        b = np.clip(0.55 - (zc - CAM_D) * 0.05, 0.12, 0.45)
-        char[iy, ix] = ch
-        col[iy, ix] = np.array([0.55, 0.62, 0.75]) * b[:, None]
         back = ~self.front
         x, y = self._flakes(back, clock, cols, rows, off)
         char[y, x] = self.ch[back]
@@ -675,6 +658,100 @@ def snowman_pose(pl, nl, kk, t):
     return P, N                                             # world coordinates
 
 
+# how strongly each kind claims a cell when several kinds share its front layer
+KIND_WEIGHT = np.ones(16)
+for _k, _w in ((LIGHT, 4), (STAR, 4), (BAUBLE, 3), (GARLAND, 2.5), (WRAP, 3), (SM_FACE, 4), (SM_HAT, 2),
+               (TRUNK, 0.5)):
+    KIND_WEIGHT[_k] = _w
+FRONT_TOL = 0.12        # points this close behind the nearest one in a cell count as its front layer
+
+
+def rasterize(char, col, off, state, cell_hash, okI, cell_of, depth, kv, lum, colours, chars, dx, dy,
+              rows, cols):
+    """Turn points into cells without flicker.
+
+    The old way kept only the single nearest point per cell, so as the tree turned the winner
+    (and with it glyph and colour) kept jumping. Now every cell looks at its front layer of
+    points: the kind is a weighted vote, colour and brightness are averages, and the foliage
+    glyph is picked from the averaged brightness with hysteresis. Small changes in which points
+    land in a cell now only nudge the result."""
+    if len(okI) == 0:
+        return
+    ncell = rows * cols
+    ci, dep = cell_of[okI], depth[okI]
+    # one float key = cell + depth squeezed into [0, 1): a single argsort sorts by cell, nearest first
+    order = np.argsort(ci + np.clip((dep - 0.5) / 12.0, 0, 0.999))
+    ci, dep, idx = ci[order], dep[order], okI[order]
+    first = np.r_[True, ci[1:] != ci[:-1]]
+    group = np.cumsum(first) - 1
+    zmin = dep[first][group]
+    front = dep <= zmin + FRONT_TOL
+
+    k = kv[idx]
+    nk = len(KIND_WEIGHT)
+    votes = np.bincount(ci[front] * nk + k[front], weights=KIND_WEIGHT[k[front]], minlength=ncell * nk)
+    cell_kind = votes.reshape(ncell, nk).argmax(1)
+    use = front & (k == cell_kind[ci])                # front points of the winning kind
+    uc, ui = ci[use], idx[use]
+    n = np.bincount(uc, minlength=ncell)
+    has = n > 0
+    nn = np.maximum(n, 1)
+    avg_col = np.stack([np.bincount(uc, weights=colours[ui, j], minlength=ncell) for j in range(3)], 1) / nn[:, None]
+    avg_lum = np.bincount(uc, weights=lum[ui], minlength=ncell) / nn
+
+    # glyph: from the nearest point of the winning kind (words like 반짝 / 선물 / 모자 stay intact)
+    uf = np.r_[True, uc[1:] != uc[:-1]]
+    rep_cell, rep_pt = uc[uf], ui[uf]
+    flat_char = char.reshape(-1)
+    flat_char[rep_cell] = chars[rep_pt]
+    col.reshape(-1, 3)[has] = np.clip(avg_col[has], 0, 1)
+
+    # foliage cells: glyph and tone from the averaged brightness, with hysteresis
+    leaf = has & (cell_kind == NEEDLE)
+    level = avg_lum[leaf] * 3.6
+    step = np.clip(level.astype(int), 0, 3)
+    before = state["step"].reshape(-1)[leaf]
+    keep = (before >= 0) & (np.abs(level - (before + 0.5)) < 0.85)
+    step = np.where(keep, before, step).astype(np.int8)
+    flat_char[leaf] = NEEDLE_POOLS[step, cell_hash.reshape(-1)[leaf]]
+    remembered = np.full(ncell, -1, np.int8)
+    remembered[leaf] = step
+    state["step"] = remembered.reshape(rows, cols)
+
+    if off is not None:                               # sub-cell position: average of the used points
+        off[0].reshape(-1)[has] = (np.bincount(uc, weights=dx[ui], minlength=ncell) / nn)[has]
+        off[1].reshape(-1)[has] = (np.bincount(uc, weights=dy[ui], minlength=ncell) / nn)[has]
+
+
+def ground_snow(char, col, ang, t, cols, rows):
+    """Snow on the ground as a smooth field: every floor cell is traced back to a spot on the
+    ground and asks how much snow lies there. It turns with the scene without blinking."""
+    horizon = rows * 0.47
+    f = min(rows * 1.05, cols * 1.44)
+    ys = np.arange(rows)[:, None] + 0.0
+    xs = np.arange(cols)[None, :] + 0.0
+    below = ys - horizon > 0.5
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zc = np.where(below, -(GROUND - CAM_Y) * f / np.maximum(ys - horizon, 0.5), 1e3)
+    X = (xs - cols / 2) * zc / (f * ASPECT)
+    Z = zc - CAM_D
+    c, s_ = math.cos(-ang), math.sin(-ang)
+    u, v = X * c - Z * s_, X * s_ + Z * c                 # back to ground coordinates
+    r = np.hypot(u, v)
+    reach = 2.7 * smooth((t - T_GSNOW[0]) / 2.5)           # spreads out from the trunk ...
+    fill = smooth((t - T_GSNOW[0]) / (T_GSNOW[1] - T_GSNOW[0]))   # ... and keeps piling up
+    n = (0.5 + 0.22 * np.sin(5.1 * u + 1.3) * np.sin(4.7 * v + 0.4)
+         + 0.16 * np.sin(11.3 * u - 7.1 * v) + 0.12 * np.sin(9.7 * v + 6.1 * u + 2.0))
+    amount = np.clip((n + 0.55 * fill - 0.62) / 0.35, 0, 1) * smooth((reach - r) / 0.4)   # patchy, not a white sheet
+    amount = np.where(below & (zc < 9) & (r > 0.1), amount, 0.0)
+    fade = np.clip(1.3 - (zc - CAM_D) * 0.12, 0.35, 1.2)   # far snow is darker
+    lumg = amount * fade
+    on = lumg > 0.08
+    level = np.clip((amount * 3.2).astype(int), 0, 3)
+    char[on] = GSNOW_CH[np.maximum(level[on], _cell_hash(rows, cols)[on] % 2)]
+    col[on] = np.array(SNOW_W) * np.clip(0.18 + 0.5 * lumg[on], 0, 1)[:, None]
+
+
 _STATE = {}
 
 
@@ -707,6 +784,7 @@ def render(D, t, cols, rows, back, clock, draw_msg=True, subcell=False):
     info = {"rotation": math.degrees(ang) % 360}
     off = (np.zeros((rows, cols), np.float32), np.zeros((rows, cols), np.float32)) if subcell else None
 
+    ground_snow(char, col, ang, t, cols, rows)
     back.draw(char, col, ang, clock, cols, rows, off)
 
     k = D["k"]
@@ -764,15 +842,8 @@ def render(D, t, cols, rows, back, clock, draw_msg=True, subcell=False):
     cell_hash = _cell_hash(rows, cols)
     state = _cell_state(rows, cols)
     iyc, ixc = np.clip(iy, 0, rows - 1), np.clip(ix, 0, cols - 1)
-    level = lum[nd] * 3.6
-    step = np.clip(level.astype(int), 0, 3)
-    before = state["step"][iyc[nd], ixc[nd]]
-    # hysteresis: a cell keeps last frame's step unless the brightness clearly moved on
-    keep = (before >= 0) & (np.abs(level - (before + 0.5)) < 0.85)
-    step = np.where(keep, before, step)
+    step = np.clip((lum[nd] * 3.6).astype(int), 0, 3)
     chars[nd] = NEEDLE_POOLS[step, cell_hash[iyc[nd], ixc[nd]]]
-    step_of_point = np.full(len(kv), -1, np.int8)
-    step_of_point[nd] = step
     cv = cv.copy()
     cv[nd] = FOLIAGE_TONES[step]
     chars[lit] = LIGHT_G
@@ -780,8 +851,6 @@ def render(D, t, cols, rows, back, clock, draw_msg=True, subcell=False):
     chars[bm] = ramp(BAUBLE_CH, lum[bm] * 2.4)
     sm = kv == SNOW
     chars[sm] = ramp(SNOW_CH, lum[sm] * 2.0 + ph[sm])
-    gs = kv == GSNOW
-    chars[gs] = GSNOW_CH[cell_hash[iyc[gs], ixc[gs]]]   # fixed per cell, whichever flake lands there
     chars[wrap] = ramp(WRAP_CH, lum[wrap] * 2.2)
     snowball = (kv == SM_BODY) | (kv == SM_HEAD)
     chars[snowball] = ramp(SNOWMAN_CH, lum[snowball] * 2.2 + ph[snowball] * 0.5)
@@ -802,16 +871,8 @@ def render(D, t, cols, rows, back, clock, draw_msg=True, subcell=False):
 
     ok = (ix >= 0) & (ix < cols) & (iy >= 0) & (iy < rows) & (lum > 0.03)
     depth = zc - lit * 0.06 - wrap * 0.08 - shimmer * 0.03 - st * 0.05   # lights, ribbon, tinsel, star win ties
-    order = np.argsort(-depth[ok])           # far first, near overwrites
-    cell = (iy * cols + ix)[ok][order]
-    char.reshape(-1)[cell] = chars[ok][order]
-    col.reshape(-1, 3)[cell] = colours[ok][order]
-    remembered = np.full(rows * cols, -1, np.int8)
-    remembered[cell] = step_of_point[ok][order]
-    state["step"] = remembered.reshape(rows, cols)
-    if subcell:
-        off[0].reshape(-1)[cell] = (sx - ix)[ok][order]
-        off[1].reshape(-1)[cell] = (sy - iy)[ok][order]
+    rasterize(char, col, off, state, cell_hash, np.flatnonzero(ok), iy * cols + ix, depth, kv, lum,
+              colours, chars, sx - ix, sy - iy, rows, cols)
 
     back.draw_front(char, col, clock, cols, rows, off)
 
